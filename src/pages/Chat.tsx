@@ -9,6 +9,12 @@ import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 
 type Msg = { role: "user" | "assistant"; content: string };
+type ChatErrorResponse = {
+  ok?: false;
+  code?: "RATE_LIMIT" | "NO_CREDITS" | "BAD_REQUEST" | "UPSTREAM_ERROR" | "SERVER_ERROR";
+  error?: string;
+  retryAfterMs?: number;
+};
 
 const Chat = () => {
   const { id } = useParams();
@@ -21,6 +27,7 @@ const Chat = () => {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [rateLimitUntil, setRateLimitUntil] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -54,25 +61,58 @@ const Chat = () => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, streaming]);
 
+  useEffect(() => {
+    if (!rateLimitUntil) return;
+    const remaining = rateLimitUntil - Date.now();
+    if (remaining <= 0) {
+      setRateLimitUntil(null);
+      return;
+    }
+    const timer = window.setTimeout(() => setRateLimitUntil(null), remaining);
+    return () => window.clearTimeout(timer);
+  }, [rateLimitUntil]);
+
   const send = async () => {
     if (!input.trim() || !convo || streaming) return;
+    if (rateLimitUntil && Date.now() < rateLimitUntil) {
+      const seconds = Math.max(1, Math.ceil((rateLimitUntil - Date.now()) / 1000));
+      toast.error(`Please wait ${seconds}s before sending another message`);
+      return;
+    }
+
     const userMsg: Msg = { role: "user", content: input.trim() };
     const next = [...messages, userMsg];
     setMessages(next);
-    setPendingSave(p => [...p, userMsg]);
+    setPendingSave((previous) => [...previous, userMsg]);
     setInput("");
     setStreaming(true);
+
+    const rollbackUserMessage = () => {
+      setMessages((previous) => {
+        const last = previous[previous.length - 1];
+        if (last?.role === "user" && last.content === userMsg.content) {
+          return previous.slice(0, -1);
+        }
+        return previous;
+      });
+      setPendingSave((previous) => previous.filter((message) => message !== userMsg));
+      setInput(userMsg.content);
+    };
 
     const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
     let assistantSoFar = "";
     const upsert = (chunk: string) => {
       assistantSoFar += chunk;
-      setMessages(prev => {
-        const last = prev[prev.length - 1];
+      setMessages((previous) => {
+        const last = previous[previous.length - 1];
         if (last?.role === "assistant") {
-          return prev.map((m, i) => (i === prev.length - 1 ? { ...m, content: assistantSoFar } : m));
+          return previous.map((message, index) => (
+            index === previous.length - 1
+              ? { ...message, content: assistantSoFar }
+              : message
+          ));
         }
-        return [...prev, { role: "assistant", content: assistantSoFar }];
+        return [...previous, { role: "assistant", content: assistantSoFar }];
       });
     };
 
@@ -90,14 +130,28 @@ const Chat = () => {
         }),
       });
 
-      if (!resp.ok || !resp.body) {
-        if (resp.status === 429) toast.error("Too many messages — please wait ~20s and try again");
-        else if (resp.status === 402) toast.error("Out of AI credits — add funds in workspace settings");
-        else toast.error("Chat failed");
-        // Roll back optimistic user message so they can retry without a stuck UI
-        setMessages(prev => prev.filter((_, i) => i !== prev.length - 1 || prev[prev.length - 1].role !== "user" || prev[prev.length - 1].content !== userMsg.content));
-        setPendingSave(p => p.filter(m => m !== userMsg));
-        setInput(userMsg.content);
+      const contentType = resp.headers.get("content-type") ?? "";
+      const isJsonError = contentType.includes("application/json");
+
+      if (!resp.ok || !resp.body || isJsonError) {
+        let payload: ChatErrorResponse | null = null;
+        try {
+          payload = await resp.json();
+        } catch {
+          payload = null;
+        }
+
+        if (resp.status === 429 || payload?.code === "RATE_LIMIT") {
+          const retryAfterMs = payload?.retryAfterMs ?? 20000;
+          setRateLimitUntil(Date.now() + retryAfterMs);
+          toast.error(payload?.error ?? "Too many messages — please wait about 20 seconds and try again");
+        } else if (resp.status === 402 || payload?.code === "NO_CREDITS") {
+          toast.error(payload?.error ?? "Out of AI credits — add funds in workspace settings");
+        } else {
+          toast.error(payload?.error ?? "Chat failed");
+        }
+
+        rollbackUserMessage();
         setStreaming(false);
         return;
       }
@@ -119,23 +173,27 @@ const Chat = () => {
           if (line.startsWith(":") || line.trim() === "") continue;
           if (!line.startsWith("data: ")) continue;
           const json = line.slice(6).trim();
-          if (json === "[DONE]") { done = true; break; }
+          if (json === "[DONE]") {
+            done = true;
+            break;
+          }
           try {
             const parsed = JSON.parse(json);
-            const c = parsed.choices?.[0]?.delta?.content as string | undefined;
-            if (c) upsert(c);
+            const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+            if (content) upsert(content);
           } catch {
-            textBuffer = line + "\n" + textBuffer;
+            textBuffer = `${line}\n${textBuffer}`;
             break;
           }
         }
       }
 
       if (assistantSoFar) {
-        setPendingSave(p => [...p, { role: "assistant", content: assistantSoFar }]);
+        setPendingSave((previous) => [...previous, { role: "assistant", content: assistantSoFar }]);
       }
-    } catch (e) {
-      console.error(e);
+    } catch (error) {
+      console.error(error);
+      rollbackUserMessage();
       toast.error("Connection lost");
     } finally {
       setStreaming(false);
