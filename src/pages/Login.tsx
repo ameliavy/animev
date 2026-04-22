@@ -52,7 +52,7 @@ const Login = () => {
         <div className="text-center mb-8 animate-fade-in">
           <div className="inline-flex items-center gap-2 mb-3">
             <Sparkles className="w-8 h-8 text-primary animate-float" />
-            <h1 className="text-4xl font-bold text-aurora">AnimeVerse</h1>
+            <h1 className="text-4xl font-bold text-aurora">AnimeV</h1>
           </div>
           <p className="text-muted-foreground">Step into the cosmos. Chat with your favorites.</p>
         </div>
