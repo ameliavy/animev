@@ -3,7 +3,7 @@ import { useNavigate, useParams } from "react-router-dom";
 import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ArrowLeft, Send, Save, Loader2, Sparkles } from "lucide-react";
+import { ArrowLeft, Send, Save, Loader2, Sparkles, WifiOff, Cpu } from "lucide-react";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 import {
@@ -12,13 +12,13 @@ import {
   type LocalConversation,
   type LocalMsg,
 } from "@/lib/localChatStore";
-
-type ChatErrorResponse = {
-  ok?: false;
-  code?: "RATE_LIMIT" | "NO_CREDITS" | "BAD_REQUEST" | "UPSTREAM_ERROR" | "SERVER_ERROR";
-  error?: string;
-  retryAfterMs?: number;
-};
+import {
+  getEngine,
+  isWebGPUSupported,
+  onProgress,
+  streamLocalChat,
+  type LocalMsg as AIMsg,
+} from "@/lib/localAI";
 
 const Chat = () => {
   const { id } = useParams();
@@ -28,10 +28,16 @@ const Chat = () => {
   const [convo, setConvo] = useState<LocalConversation | null>(null);
   const [messages, setMessages] = useState<LocalMsg[]>([]);
   const [input, setInput] = useState("");
-  const [busyCount, setBusyCount] = useState(0); // # of in-flight AI replies
+  const [busyCount, setBusyCount] = useState(0);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
-  const [rateLimitUntil, setRateLimitUntil] = useState<number | null>(null);
+
+  // Local-AI loading state
+  const [modelReady, setModelReady] = useState(false);
+  const [modelProgress, setModelProgress] = useState(0);
+  const [modelText, setModelText] = useState("Preparing on-device AI…");
+  const [modelError, setModelError] = useState<string | null>(null);
+  const [online, setOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -59,43 +65,69 @@ const Chat = () => {
   }, [messages, busyCount]);
 
   useEffect(() => {
-    if (!rateLimitUntil) return;
-    const remaining = rateLimitUntil - Date.now();
-    if (remaining <= 0) {
-      setRateLimitUntil(null);
+    inputRef.current?.focus();
+  }, [convo, busyCount, messages.length, modelReady]);
+
+  // Track online/offline
+  useEffect(() => {
+    const up = () => setOnline(true);
+    const down = () => setOnline(false);
+    window.addEventListener("online", up);
+    window.addEventListener("offline", down);
+    return () => {
+      window.removeEventListener("online", up);
+      window.removeEventListener("offline", down);
+    };
+  }, []);
+
+  // Boot the local model
+  useEffect(() => {
+    if (!convo) return;
+    if (!isWebGPUSupported()) {
+      setModelError("On-device AI needs WebGPU. Try Chrome on Android or a recent iOS/desktop browser.");
       return;
     }
-    const timer = window.setTimeout(() => setRateLimitUntil(null), remaining);
-    return () => window.clearTimeout(timer);
-  }, [rateLimitUntil]);
-
-  // Keep cursor focused on the input bar.
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, [convo, busyCount, messages.length]);
+    const off = onProgress((p) => {
+      setModelProgress(Math.round((p.progress ?? 0) * 100));
+      setModelText(p.text || "Loading model…");
+    });
+    let cancelled = false;
+    getEngine()
+      .then(() => { if (!cancelled) setModelReady(true); })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        const msg = e instanceof Error ? e.message : "Failed to load model";
+        setModelError(msg);
+      });
+    return () => {
+      cancelled = true;
+      off();
+    };
+  }, [convo]);
 
   const send = async () => {
     if (!input.trim() || !convo) return;
-    if (rateLimitUntil && Date.now() < rateLimitUntil) {
-      const seconds = Math.max(1, Math.ceil((rateLimitUntil - Date.now()) / 1000));
-      toast.error(`Please wait ${seconds}s before sending another message`);
+    if (!modelReady) {
+      toast.error("AI is still loading — almost ready!");
       return;
     }
 
     const userMsg: LocalMsg = { role: "user", content: input.trim() };
-    // Snapshot history sent to the model = everything visible up to now.
-    const historyForModel = [...messagesRef.current, userMsg];
+    const systemPrompt = `You are ${convo.character_name} from ${convo.anime}. Stay fully in character. Reply with only what you would say — no narration, no actions in asterisks, no descriptions. Keep replies short, casual, and very human-like. Exclamation marks are fine.`;
+    const historyForModel: AIMsg[] = [
+      { role: "system", content: systemPrompt },
+      ...messagesRef.current.map((m) => ({ role: m.role, content: m.content }) as AIMsg),
+      { role: "user", content: userMsg.content },
+    ];
+
     setMessages((prev) => [...prev, userMsg]);
     setDirty(true);
     setInput("");
     setBusyCount((n) => n + 1);
-    // Refocus input immediately so the user can keep typing.
     requestAnimationFrame(() => inputRef.current?.focus());
 
-    const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
     let assistantSoFar = "";
     let assistantInserted = false;
-
     const upsertAssistant = (chunk: string) => {
       assistantSoFar += chunk;
       setMessages((prev) => {
@@ -103,7 +135,6 @@ const Chat = () => {
           assistantInserted = true;
           return [...prev, { role: "assistant", content: assistantSoFar }];
         }
-        // Update the last assistant message we appended (find from end).
         const next = [...prev];
         for (let i = next.length - 1; i >= 0; i--) {
           if (next[i].role === "assistant") {
@@ -116,85 +147,18 @@ const Chat = () => {
     };
 
     try {
-      const resp = await fetch(CHAT_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-        },
-        body: JSON.stringify({
-          messages: historyForModel,
-          character: convo.character_name,
-          anime: convo.anime,
-        }),
-      });
-
-      const contentType = resp.headers.get("content-type") ?? "";
-      const isJsonError = contentType.includes("application/json");
-
-      if (!resp.ok || !resp.body || isJsonError) {
-        let payload: ChatErrorResponse | null = null;
-        try {
-          payload = await resp.json();
-        } catch {
-          payload = null;
-        }
-
-        if (resp.status === 429 || payload?.code === "RATE_LIMIT") {
-          const retryAfterMs = payload?.retryAfterMs ?? 20000;
-          setRateLimitUntil(Date.now() + retryAfterMs);
-          toast.error(payload?.error ?? "Too many messages — please wait ~20s and try again");
-        } else if (resp.status === 402 || payload?.code === "NO_CREDITS") {
-          toast.error(payload?.error ?? "Out of AI credits — add funds in workspace settings");
-        } else {
-          toast.error(payload?.error ?? "Chat failed");
-        }
-        return;
-      }
-
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let textBuffer = "";
-      let done = false;
-
-      while (!done) {
-        const { done: d, value } = await reader.read();
-        if (d) break;
-        textBuffer += decoder.decode(value, { stream: true });
-        let idx: number;
-        while ((idx = textBuffer.indexOf("\n")) !== -1) {
-          let line = textBuffer.slice(0, idx);
-          textBuffer = textBuffer.slice(idx + 1);
-          if (line.endsWith("\r")) line = line.slice(0, -1);
-          if (line.startsWith(":") || line.trim() === "") continue;
-          if (!line.startsWith("data: ")) continue;
-          const json = line.slice(6).trim();
-          if (json === "[DONE]") {
-            done = true;
-            break;
-          }
-          try {
-            const parsed = JSON.parse(json);
-            const content = parsed.choices?.[0]?.delta?.content as string | undefined;
-            if (content) upsertAssistant(content);
-          } catch {
-            textBuffer = `${line}\n${textBuffer}`;
-            break;
-          }
-        }
-      }
-
+      await streamLocalChat(historyForModel, upsertAssistant);
       if (assistantSoFar) setDirty(true);
     } catch (error) {
       console.error(error);
-      toast.error("Connection lost");
+      toast.error(error instanceof Error ? error.message : "AI error");
     } finally {
       setBusyCount((n) => Math.max(0, n - 1));
       requestAnimationFrame(() => inputRef.current?.focus());
     }
   };
 
-  const handleSave = async () => {
+  const handleSave = () => {
     if (!user || !id || !dirty) {
       toast.info("Nothing new to save");
       return;
@@ -204,7 +168,7 @@ const Chat = () => {
       saveMessages(user.id, id, messagesRef.current);
       setDirty(false);
       toast.success("Chat saved ✨");
-    } catch (e) {
+    } catch {
       toast.error("Could not save chat");
     } finally {
       setSaving(false);
@@ -221,8 +185,8 @@ const Chat = () => {
   }
 
   return (
-    <div className="stars relative h-screen overflow-hidden">
-      <header className="fixed top-0 left-0 right-0 z-20 glass border-b border-border/40 px-4 py-3 flex items-center gap-3">
+    <div className="stars relative h-[100dvh] overflow-hidden">
+      <header className="fixed top-0 left-0 right-0 z-20 glass border-b border-border/40 px-4 py-3 flex items-center gap-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
         <button onClick={() => navigate("/select")} className="text-muted-foreground hover:text-foreground transition-cosmic">
           <ArrowLeft className="w-5 h-5" />
         </button>
@@ -230,17 +194,47 @@ const Chat = () => {
           <Sparkles className="w-5 h-5 text-primary-foreground" />
         </div>
         <div className="flex-1 min-w-0">
-          <div className="font-semibold truncate">{convo.character_name}</div>
-          <div className="text-xs text-muted-foreground truncate">{convo.anime}</div>
+          <div className="font-semibold truncate flex items-center gap-2">
+            {convo.character_name}
+            {!online && <WifiOff className="w-3.5 h-3.5 text-muted-foreground" aria-label="offline" />}
+          </div>
+          <div className="text-xs text-muted-foreground truncate flex items-center gap-1">
+            <Cpu className="w-3 h-3" /> on-device · {convo.anime}
+          </div>
         </div>
         <Button onClick={handleSave} disabled={saving || !dirty} variant="cosmic-outline" size="sm">
-          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <><Save className="w-4 h-4 mr-2" />Save chat{dirty && " •"}</>}
+          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <><Save className="w-4 h-4 mr-2" />Save{dirty && " •"}</>}
         </Button>
       </header>
 
-      <div ref={scrollRef} className="absolute inset-0 z-10 overflow-y-auto pt-20 pb-28 px-4">
+      <div ref={scrollRef} className="absolute inset-0 z-10 overflow-y-auto pt-24 pb-32 px-4">
         <div className="max-w-2xl mx-auto space-y-4">
-          {messages.length === 0 && (
+          {!modelReady && !modelError && (
+            <div className="glass rounded-2xl p-5 text-sm space-y-3 animate-fade-in">
+              <div className="flex items-center gap-2 font-semibold">
+                <Loader2 className="w-4 h-4 animate-spin text-primary" />
+                Setting up on-device AI
+              </div>
+              <p className="text-muted-foreground text-xs">
+                The first time takes a minute while the model downloads (~1 GB).
+                After that it lives on your device — chat anytime, even without wifi.
+              </p>
+              <div className="h-2 rounded-full bg-muted/40 overflow-hidden">
+                <div
+                  className="h-full bg-aurora transition-all"
+                  style={{ width: `${modelProgress}%` }}
+                />
+              </div>
+              <div className="text-xs text-muted-foreground truncate">{modelText}</div>
+            </div>
+          )}
+          {modelError && (
+            <div className="glass rounded-2xl p-5 text-sm space-y-2 border border-destructive/40">
+              <div className="font-semibold text-destructive">Can't start on-device AI</div>
+              <p className="text-muted-foreground text-xs">{modelError}</p>
+            </div>
+          )}
+          {modelReady && messages.length === 0 && (
             <div className="text-center text-muted-foreground py-12 animate-fade-in">
               Say hi to <span className="text-aurora font-semibold">{convo.character_name}</span> ✨
             </div>
@@ -271,7 +265,7 @@ const Chat = () => {
         </div>
       </div>
 
-      <div className="fixed bottom-0 left-0 right-0 z-20 glass border-t border-border/40 p-4">
+      <div className="fixed bottom-0 left-0 right-0 z-20 glass border-t border-border/40 p-4 pb-[max(1rem,env(safe-area-inset-bottom))]">
         <form
           onSubmit={(e) => { e.preventDefault(); send(); }}
           className="max-w-2xl mx-auto flex gap-2"
@@ -280,11 +274,12 @@ const Chat = () => {
             ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder={`Message ${convo.character_name}...`}
+            placeholder={modelReady ? `Message ${convo.character_name}...` : "Loading on-device AI…"}
             autoFocus
+            inputMode="text"
             className="bg-input/60 flex-1"
           />
-          <Button type="submit" variant="hero" size="icon" disabled={!input.trim()}>
+          <Button type="submit" variant="hero" size="icon" disabled={!input.trim() || !modelReady}>
             <Send className="w-4 h-4" />
           </Button>
         </form>
