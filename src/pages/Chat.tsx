@@ -61,6 +61,17 @@ const Chat = () => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages, streaming]);
 
+  useEffect(() => {
+    if (!rateLimitUntil) return;
+    const remaining = rateLimitUntil - Date.now();
+    if (remaining <= 0) {
+      setRateLimitUntil(null);
+      return;
+    }
+    const timer = window.setTimeout(() => setRateLimitUntil(null), remaining);
+    return () => window.clearTimeout(timer);
+  }, [rateLimitUntil]);
+
   const send = async () => {
     if (!input.trim() || !convo || streaming) return;
     const userMsg: Msg = { role: "user", content: input.trim() };
