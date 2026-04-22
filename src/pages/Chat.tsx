@@ -9,6 +9,12 @@ import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
 
 type Msg = { role: "user" | "assistant"; content: string };
+type ChatErrorResponse = {
+  ok?: false;
+  code?: "RATE_LIMIT" | "NO_CREDITS" | "BAD_REQUEST" | "UPSTREAM_ERROR" | "SERVER_ERROR";
+  error?: string;
+  retryAfterMs?: number;
+};
 
 const Chat = () => {
   const { id } = useParams();
@@ -21,6 +27,7 @@ const Chat = () => {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [rateLimitUntil, setRateLimitUntil] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
