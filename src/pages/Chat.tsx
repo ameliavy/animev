@@ -91,9 +91,13 @@ const Chat = () => {
       });
 
       if (!resp.ok || !resp.body) {
-        if (resp.status === 429) toast.error("Rate limit reached — wait a moment");
+        if (resp.status === 429) toast.error("Too many messages — please wait ~20s and try again");
         else if (resp.status === 402) toast.error("Out of AI credits — add funds in workspace settings");
         else toast.error("Chat failed");
+        // Roll back optimistic user message so they can retry without a stuck UI
+        setMessages(prev => prev.filter((_, i) => i !== prev.length - 1 || prev[prev.length - 1].role !== "user" || prev[prev.length - 1].content !== userMsg.content));
+        setPendingSave(p => p.filter(m => m !== userMsg));
+        setInput(userMsg.content);
         setStreaming(false);
         return;
       }
