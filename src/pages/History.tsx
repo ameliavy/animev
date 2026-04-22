@@ -5,49 +5,32 @@ import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft, MessageSquare, Trash2, Loader2, Plus } from "lucide-react";
 import { toast } from "sonner";
-
-type Conversation = {
-  id: string;
-  anime: string;
-  character_name: string;
-  updated_at: string;
-};
+import {
+  listConversations,
+  deleteConversation,
+  type LocalConversation,
+} from "@/lib/localChatStore";
 
 const History = () => {
   const navigate = useNavigate();
   const { user, loading } = useAuth();
-  const [convos, setConvos] = useState<Conversation[]>([]);
+  const [convos, setConvos] = useState<LocalConversation[]>([]);
   const [fetching, setFetching] = useState(true);
 
   useEffect(() => {
     if (!loading && !user) navigate("/", { replace: true });
   }, [user, loading, navigate]);
 
-  const load = async () => {
-    setFetching(true);
-    const { data, error } = await supabase
-      .from("conversations")
-      .select("id, anime, character_name, updated_at")
-      .order("updated_at", { ascending: false });
-    setFetching(false);
-    if (error) {
-      toast.error(error.message);
-      return;
-    }
-    setConvos(data ?? []);
-  };
-
   useEffect(() => {
-    if (user) load();
+    if (!user) return;
+    setConvos(listConversations(user.id));
+    setFetching(false);
   }, [user]);
 
-  const handleDelete = async (id: string) => {
-    const { error } = await supabase.from("conversations").delete().eq("id", id);
-    if (error) {
-      toast.error(error.message);
-      return;
-    }
-    setConvos(c => c.filter(x => x.id !== id));
+  const handleDelete = (id: string) => {
+    if (!user) return;
+    deleteConversation(user.id, id);
+    setConvos((c) => c.filter((x) => x.id !== id));
     toast.success("Chat deleted");
   };
 
@@ -94,5 +77,8 @@ const History = () => {
     </div>
   );
 };
+
+// Keep supabase import to avoid bundler tree-shake removal warnings if any
+void supabase;
 
 export default History;

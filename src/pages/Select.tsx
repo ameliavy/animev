@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { toast } from "sonner";
 import { LogOut, History, Sparkles, Loader2 } from "lucide-react";
+import { hasAnyConversation } from "@/lib/localChatStore";
 
 const Select = () => {
   const navigate = useNavigate();
@@ -21,13 +22,8 @@ const Select = () => {
 
   useEffect(() => {
     if (!user) return;
-    supabase
-      .from("conversations")
-      .select("id", { count: "exact", head: true })
-      .then(({ count }) => {
-        setHasHistory((count ?? 0) > 0);
-        setChecking(false);
-      });
+    setHasHistory(hasAnyConversation(user.id));
+    setChecking(false);
   }, [user]);
 
   const handleContinue = () => {

@@ -1,14 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ArrowLeft, Send, Save, Loader2, Sparkles } from "lucide-react";
 import { toast } from "sonner";
 import ReactMarkdown from "react-markdown";
+import {
+  getConversation,
+  saveMessages,
+  type LocalConversation,
+  type LocalMsg,
+} from "@/lib/localChatStore";
 
-type Msg = { role: "user" | "assistant"; content: string };
 type ChatErrorResponse = {
   ok?: false;
   code?: "RATE_LIMIT" | "NO_CREDITS" | "BAD_REQUEST" | "UPSTREAM_ERROR" | "SERVER_ERROR";
@@ -21,14 +25,18 @@ const Chat = () => {
   const navigate = useNavigate();
   const { user, loading } = useAuth();
 
-  const [convo, setConvo] = useState<{ anime: string; character_name: string } | null>(null);
-  const [messages, setMessages] = useState<Msg[]>([]);
-  const [pendingSave, setPendingSave] = useState<Msg[]>([]);
+  const [convo, setConvo] = useState<LocalConversation | null>(null);
+  const [messages, setMessages] = useState<LocalMsg[]>([]);
   const [input, setInput] = useState("");
-  const [streaming, setStreaming] = useState(false);
+  const [busyCount, setBusyCount] = useState(0); // # of in-flight AI replies
   const [saving, setSaving] = useState(false);
+  const [dirty, setDirty] = useState(false);
   const [rateLimitUntil, setRateLimitUntil] = useState<number | null>(null);
+
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const messagesRef = useRef<LocalMsg[]>([]);
+  messagesRef.current = messages;
 
   useEffect(() => {
     if (!loading && !user) navigate("/", { replace: true });
@@ -36,30 +44,19 @@ const Chat = () => {
 
   useEffect(() => {
     if (!user || !id) return;
-    (async () => {
-      const { data: c, error } = await supabase
-        .from("conversations")
-        .select("anime, character_name")
-        .eq("id", id)
-        .single();
-      if (error || !c) {
-        toast.error("Chat not found");
-        navigate("/select");
-        return;
-      }
-      setConvo(c);
-      const { data: msgs } = await supabase
-        .from("messages")
-        .select("role, content")
-        .eq("conversation_id", id)
-        .order("created_at");
-      setMessages((msgs as Msg[]) ?? []);
-    })();
+    const c = getConversation(user.id, id);
+    if (!c) {
+      toast.error("Chat not found");
+      navigate("/select");
+      return;
+    }
+    setConvo(c);
+    setMessages(c.messages);
   }, [user, id, navigate]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-  }, [messages, streaming]);
+  }, [messages, busyCount]);
 
   useEffect(() => {
     if (!rateLimitUntil) return;
@@ -72,47 +69,49 @@ const Chat = () => {
     return () => window.clearTimeout(timer);
   }, [rateLimitUntil]);
 
+  // Keep cursor focused on the input bar.
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, [convo, busyCount, messages.length]);
+
   const send = async () => {
-    if (!input.trim() || !convo || streaming) return;
+    if (!input.trim() || !convo) return;
     if (rateLimitUntil && Date.now() < rateLimitUntil) {
       const seconds = Math.max(1, Math.ceil((rateLimitUntil - Date.now()) / 1000));
       toast.error(`Please wait ${seconds}s before sending another message`);
       return;
     }
 
-    const userMsg: Msg = { role: "user", content: input.trim() };
-    const next = [...messages, userMsg];
-    setMessages(next);
-    setPendingSave((previous) => [...previous, userMsg]);
+    const userMsg: LocalMsg = { role: "user", content: input.trim() };
+    // Snapshot history sent to the model = everything visible up to now.
+    const historyForModel = [...messagesRef.current, userMsg];
+    setMessages((prev) => [...prev, userMsg]);
+    setDirty(true);
     setInput("");
-    setStreaming(true);
-
-    const rollbackUserMessage = () => {
-      setMessages((previous) => {
-        const last = previous[previous.length - 1];
-        if (last?.role === "user" && last.content === userMsg.content) {
-          return previous.slice(0, -1);
-        }
-        return previous;
-      });
-      setPendingSave((previous) => previous.filter((message) => message !== userMsg));
-      setInput(userMsg.content);
-    };
+    setBusyCount((n) => n + 1);
+    // Refocus input immediately so the user can keep typing.
+    requestAnimationFrame(() => inputRef.current?.focus());
 
     const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
     let assistantSoFar = "";
-    const upsert = (chunk: string) => {
+    let assistantInserted = false;
+
+    const upsertAssistant = (chunk: string) => {
       assistantSoFar += chunk;
-      setMessages((previous) => {
-        const last = previous[previous.length - 1];
-        if (last?.role === "assistant") {
-          return previous.map((message, index) => (
-            index === previous.length - 1
-              ? { ...message, content: assistantSoFar }
-              : message
-          ));
+      setMessages((prev) => {
+        if (!assistantInserted) {
+          assistantInserted = true;
+          return [...prev, { role: "assistant", content: assistantSoFar }];
         }
-        return [...previous, { role: "assistant", content: assistantSoFar }];
+        // Update the last assistant message we appended (find from end).
+        const next = [...prev];
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].role === "assistant") {
+            next[i] = { ...next[i], content: assistantSoFar };
+            break;
+          }
+        }
+        return next;
       });
     };
 
@@ -124,7 +123,7 @@ const Chat = () => {
           Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
         },
         body: JSON.stringify({
-          messages: next,
+          messages: historyForModel,
           character: convo.character_name,
           anime: convo.anime,
         }),
@@ -144,15 +143,12 @@ const Chat = () => {
         if (resp.status === 429 || payload?.code === "RATE_LIMIT") {
           const retryAfterMs = payload?.retryAfterMs ?? 20000;
           setRateLimitUntil(Date.now() + retryAfterMs);
-          toast.error(payload?.error ?? "Too many messages — please wait about 20 seconds and try again");
+          toast.error(payload?.error ?? "Too many messages — please wait ~20s and try again");
         } else if (resp.status === 402 || payload?.code === "NO_CREDITS") {
           toast.error(payload?.error ?? "Out of AI credits — add funds in workspace settings");
         } else {
           toast.error(payload?.error ?? "Chat failed");
         }
-
-        rollbackUserMessage();
-        setStreaming(false);
         return;
       }
 
@@ -180,7 +176,7 @@ const Chat = () => {
           try {
             const parsed = JSON.parse(json);
             const content = parsed.choices?.[0]?.delta?.content as string | undefined;
-            if (content) upsert(content);
+            if (content) upsertAssistant(content);
           } catch {
             textBuffer = `${line}\n${textBuffer}`;
             break;
@@ -188,40 +184,32 @@ const Chat = () => {
         }
       }
 
-      if (assistantSoFar) {
-        setPendingSave((previous) => [...previous, { role: "assistant", content: assistantSoFar }]);
-      }
+      if (assistantSoFar) setDirty(true);
     } catch (error) {
       console.error(error);
-      rollbackUserMessage();
       toast.error("Connection lost");
     } finally {
-      setStreaming(false);
+      setBusyCount((n) => Math.max(0, n - 1));
+      requestAnimationFrame(() => inputRef.current?.focus());
     }
   };
 
   const handleSave = async () => {
-    if (!user || !id || pendingSave.length === 0) {
+    if (!user || !id || !dirty) {
       toast.info("Nothing new to save");
       return;
     }
     setSaving(true);
-    const rows = pendingSave.map(m => ({
-      conversation_id: id,
-      user_id: user.id,
-      role: m.role,
-      content: m.content,
-    }));
-    const { error } = await supabase.from("messages").insert(rows);
-    // Bump updated_at
-    await supabase.from("conversations").update({ anime: convo?.anime ?? "" }).eq("id", id);
-    setSaving(false);
-    if (error) {
-      toast.error(error.message);
-      return;
+    try {
+      saveMessages(user.id, id, messagesRef.current);
+      setDirty(false);
+      toast.success("Chat saved ✨");
+    } catch (e) {
+      toast.error("Could not save chat");
+    } finally {
+      setSaving(false);
+      inputRef.current?.focus();
     }
-    setPendingSave([]);
-    toast.success("Chat saved ✨");
   };
 
   if (!convo) {
@@ -245,8 +233,8 @@ const Chat = () => {
           <div className="font-semibold truncate">{convo.character_name}</div>
           <div className="text-xs text-muted-foreground truncate">{convo.anime}</div>
         </div>
-        <Button onClick={handleSave} disabled={saving || pendingSave.length === 0} variant="cosmic-outline" size="sm">
-          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <><Save className="w-4 h-4 mr-2" />Save chat{pendingSave.length > 0 && ` (${pendingSave.length})`}</>}
+        <Button onClick={handleSave} disabled={saving || !dirty} variant="cosmic-outline" size="sm">
+          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <><Save className="w-4 h-4 mr-2" />Save chat{dirty && " •"}</>}
         </Button>
       </header>
 
@@ -272,10 +260,11 @@ const Chat = () => {
               </div>
             </div>
           ))}
-          {streaming && messages[messages.length - 1]?.role !== "assistant" && (
+          {busyCount > 0 && (
             <div className="flex justify-start">
-              <div className="glass rounded-2xl px-4 py-3 text-muted-foreground">
-                <Loader2 className="w-4 h-4 animate-spin inline" />
+              <div className="glass rounded-2xl px-4 py-3 text-muted-foreground inline-flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span className="text-xs">{busyCount > 1 ? `${busyCount} replies pending…` : "thinking…"}</span>
               </div>
             </div>
           )}
@@ -288,13 +277,14 @@ const Chat = () => {
           className="max-w-2xl mx-auto flex gap-2"
         >
           <Input
+            ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder={`Message ${convo.character_name}...`}
-            disabled={streaming}
+            autoFocus
             className="bg-input/60 flex-1"
           />
-          <Button type="submit" variant="hero" size="icon" disabled={streaming || !input.trim()}>
+          <Button type="submit" variant="hero" size="icon" disabled={!input.trim()}>
             <Send className="w-4 h-4" />
           </Button>
         </form>

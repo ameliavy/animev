@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ArrowLeft, Sparkles, Loader2 } from "lucide-react";
 import { toast } from "sonner";
+import { createConversation } from "@/lib/localChatStore";
 
 const Character = () => {
   const navigate = useNavigate();
@@ -20,21 +20,17 @@ const Character = () => {
     if (!anime) navigate("/select", { replace: true });
   }, [user, loading, navigate, anime]);
 
-  const handleStart = async (e: React.FormEvent) => {
+  const handleStart = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim() || !user) return;
     setBusy(true);
-    const { data, error } = await supabase
-      .from("conversations")
-      .insert({ user_id: user.id, anime, character_name: name.trim() })
-      .select()
-      .single();
-    setBusy(false);
-    if (error || !data) {
-      toast.error(error?.message ?? "Failed to start chat");
-      return;
+    try {
+      const convo = createConversation(user.id, anime, name.trim());
+      navigate(`/chat/${convo.id}`);
+    } catch (err) {
+      toast.error("Failed to start chat");
+      setBusy(false);
     }
-    navigate(`/chat/${data.id}`);
   };
 
   return (
