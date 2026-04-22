@@ -130,7 +130,10 @@ const Chat = () => {
         }),
       });
 
-      if (!resp.ok || !resp.body) {
+      const contentType = resp.headers.get("content-type") ?? "";
+      const isJsonError = contentType.includes("application/json");
+
+      if (!resp.ok || !resp.body || isJsonError) {
         let payload: ChatErrorResponse | null = null;
         try {
           payload = await resp.json();
