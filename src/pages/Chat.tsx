@@ -171,8 +171,8 @@ const Chat = () => {
   }
 
   return (
-    <div className="stars relative min-h-screen flex flex-col">
-      <header className="relative z-10 glass border-b border-border/40 px-4 py-3 flex items-center gap-3">
+    <div className="stars relative h-screen overflow-hidden">
+      <header className="fixed top-0 left-0 right-0 z-20 glass border-b border-border/40 px-4 py-3 flex items-center gap-3">
         <button onClick={() => navigate("/select")} className="text-muted-foreground hover:text-foreground transition-cosmic">
           <ArrowLeft className="w-5 h-5" />
         </button>
@@ -188,7 +188,7 @@ const Chat = () => {
         </Button>
       </header>
 
-      <div ref={scrollRef} className="relative z-10 flex-1 overflow-y-auto px-4 py-6">
+      <div ref={scrollRef} className="absolute inset-0 z-10 overflow-y-auto pt-20 pb-28 px-4">
         <div className="max-w-2xl mx-auto space-y-4">
           {messages.length === 0 && (
             <div className="text-center text-muted-foreground py-12 animate-fade-in">
@@ -220,7 +220,7 @@ const Chat = () => {
         </div>
       </div>
 
-      <div className="relative z-10 glass border-t border-border/40 p-4">
+      <div className="fixed bottom-0 left-0 right-0 z-20 glass border-t border-border/40 p-4">
         <form
           onSubmit={(e) => { e.preventDefault(); send(); }}
           className="max-w-2xl mx-auto flex gap-2"
